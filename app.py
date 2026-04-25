@@ -26,7 +26,7 @@ def price(symbol):
         start = (datetime.now() - timedelta(days=365*25)).strftime('%d-%m-%Y')
         url = f'https://www.nseindia.com/api/historical/cm/equity?symbol={symbol}&series=["EQ"]&from={start}&to={end}'
         r = s.get(url, timeout=20)
-        return jsonify(r.json())
+        return jsonify({'status': r.status_code, 'raw': r.text[:500]})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
