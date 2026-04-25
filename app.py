@@ -2,6 +2,7 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 import requests
 from datetime import datetime, timedelta
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -15,18 +16,19 @@ def nse_session():
         'Referer': 'https://www.nseindia.com',
     })
     s.get('https://www.nseindia.com', timeout=10)
-    s.get('https://www.nseindia.com/market-data/live-equity-market', timeout=10)
+    time.sleep(1)
     return s
 
 @app.route('/price/<symbol>')
 def price(symbol):
     try:
         s = nse_session()
-        end = datetime.now().strftime('%d-%m-%Y')
-        start = (datetime.now() - timedelta(days=365*25)).strftime('%d-%m-%Y')
-        url = f'https://www.nseindia.com/api/historical/cm/equity?symbol={symbol}&series=["EQ"]&from={start}&to={end}'
+        # NSE chart data endpoint
+        end = int(datetime.now().timestamp())
+        start = int((datetime.now() - timedelta(days=365*20)).timestamp())
+        url = f'https://charting.nseindia.com/Charts/GetEODChart?identifier={symbol}_EQ&start={start}&end={end}'
         r = s.get(url, timeout=20)
-        return jsonify({'status': r.status_code, 'raw': r.text[:500]})
+        return jsonify({'status': r.status_code, 'raw': r.text[:1000]})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -35,16 +37,6 @@ def quote(symbol):
     try:
         s = nse_session()
         url = f'https://www.nseindia.com/api/quote-equity?symbol={symbol}'
-        r = s.get(url, timeout=15)
-        return jsonify(r.json())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/fundamentals/<symbol>')
-def fundamentals(symbol):
-    try:
-        s = nse_session()
-        url = f'https://www.nseindia.com/api/quote-equity?symbol={symbol}&section=trade_info'
         r = s.get(url, timeout=15)
         return jsonify(r.json())
     except Exception as e:
