@@ -3,6 +3,8 @@ from flask_cors import CORS
 import requests
 from datetime import datetime, timedelta
 import time
+import csv
+import io
 
 app = Flask(__name__)
 CORS(app)
@@ -22,13 +24,15 @@ def nse_session():
 @app.route('/price/<symbol>')
 def price(symbol):
     try:
-        s = nse_session()
-        # NSE chart data endpoint
-        end = int(datetime.now().timestamp())
-        start = int((datetime.now() - timedelta(days=365*20)).timestamp())
-        url = f'https://charting.nseindia.com/Charts/GetEODChart?identifier={symbol}_EQ&start={start}&end={end}'
-        r = s.get(url, timeout=20)
-        return jsonify({'status': r.status_code, 'raw': r.text[:1000]})
+        # Stooq serves Indian NSE stocks as SYMBOL.NS
+        url = f'https://stooq.com/q/d/l/?s={symbol.lower()}.ns&i=m'
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+        if r.status_code != 200 or 'Date' not in r.text:
+            return jsonify({'error': 'No data', 'raw': r.text[:200]}), 404
+        reader = csv.DictReader(io.StringIO(r.text))
+        data = [{'date': row['Date'], 'close': float(row['Close'])} 
+                for row in reader if row.get('Close') and row['Close'] != 'null']
+        return jsonify({'prices': data})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
