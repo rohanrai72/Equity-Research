@@ -627,67 +627,141 @@ def news(identifier: str):
     return jsonify({"error": "no announcements", "id": ident, "tried": sources_tried}), 502
 
 
+RANGE_TO_DAYS = {
+    "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365,
+    "2y": 730, "3y": 1095, "5y": 1825, "10y": 3650, "max": 7300,
+}
+
+
+def _parse_nse_date(s: str) -> Optional[str]:
+    """NSE returns dates like '24-Apr-2026' or '2024-04-24T00:00:00.000Z'."""
+    if not s:
+        return None
+    for fmt in ("%d-%b-%Y", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s.strip(), fmt).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    return s
+
+
+def fetch_nse_history(symbol: str, days: int) -> List[Dict[str, Any]]:
+    """NSE historical OHLC. Paginates yearly because NSE caps each call at ~365d."""
+    s = nse_session()
+    referer = f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}"
+    bars: List[Dict[str, Any]] = []
+    seen_dates = set()
+
+    end = datetime.utcnow()
+    target_start = end - timedelta(days=days)
+    cursor_end = end
+    max_chunks = (days // 365) + 2  # safety cap
+
+    for _ in range(max_chunks):
+        chunk_start = cursor_end - timedelta(days=365)
+        if chunk_start < target_start:
+            chunk_start = target_start
+        url = "https://www.nseindia.com/api/historical/cm/equity"
+        params = {
+            "symbol": symbol,
+            "series": '["EQ"]',
+            "from": chunk_start.strftime("%d-%m-%Y"),
+            "to": cursor_end.strftime("%d-%m-%Y"),
+        }
+        try:
+            r = s.get(url, params=params, timeout=DEFAULT_TIMEOUT, headers={"Referer": referer})
+            if r.status_code != 200:
+                log.warning("NSE history %s status=%s", symbol, r.status_code)
+                break
+            data = r.json().get("data") or []
+            if not data:
+                break
+            chunk_bars = []
+            for it in data:
+                d = _parse_nse_date(it.get("CH_TIMESTAMP") or it.get("mTIMESTAMP") or "")
+                if not d or d in seen_dates:
+                    continue
+                seen_dates.add(d)
+                def n(*keys):
+                    for k in keys:
+                        v = it.get(k)
+                        if v is not None and v != "":
+                            try:
+                                return float(v)
+                            except Exception:
+                                pass
+                    return None
+                chunk_bars.append({
+                    "date": d,
+                    "open": n("CH_OPENING_PRICE", "open"),
+                    "high": n("CH_TRADE_HIGH_PRICE", "high"),
+                    "low": n("CH_TRADE_LOW_PRICE", "low"),
+                    "close": n("CH_CLOSING_PRICE", "close"),
+                    "volume": int(n("CH_TOT_TRADED_QTY", "volume") or 0),
+                })
+            bars.extend(chunk_bars)
+            if chunk_start <= target_start:
+                break
+            cursor_end = chunk_start - timedelta(days=1)
+        except Exception as exc:
+            log.warning("NSE history chunk failed for %s: %s", symbol, exc)
+            break
+
+    bars.sort(key=lambda b: b["date"])
+    return bars
+
+
 def fetch_yahoo_chart(ticker: str, range_: str, interval: str) -> Optional[Dict[str, Any]]:
-    """Direct call to Yahoo's v8 chart endpoint. No auth/cookies required."""
-    url = f"{YF_CHART}/{ticker}"
+    """Direct call to Yahoo's v8 chart endpoint. Tries query1 then query2."""
     headers = _common_headers({
         "Accept": "application/json",
         "Origin": "https://finance.yahoo.com",
         "Referer": f"https://finance.yahoo.com/quote/{ticker}",
     })
     params = {"range": range_, "interval": interval, "includeAdjustedClose": "true"}
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=DEFAULT_TIMEOUT, proxies=PROXIES)
-        if r.status_code != 200:
-            log.warning("Yahoo chart %s -> %s", ticker, r.status_code)
-            return None
-        data = r.json()
-        result = (data.get("chart") or {}).get("result")
-        if not result:
-            err = (data.get("chart") or {}).get("error")
-            log.warning("Yahoo chart %s no result: %s", ticker, err)
-            return None
-        res = result[0]
-        timestamps = res.get("timestamp") or []
-        ind = res.get("indicators") or {}
-        quote = (ind.get("quote") or [{}])[0]
-        opens = quote.get("open") or []
-        highs = quote.get("high") or []
-        lows = quote.get("low") or []
-        closes = quote.get("close") or []
-        vols = quote.get("volume") or []
-        bars = []
-        for i, ts in enumerate(timestamps):
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        url = f"https://{host}/v8/finance/chart/{ticker}"
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=DEFAULT_TIMEOUT, proxies=PROXIES)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            result = (data.get("chart") or {}).get("result")
+            if not result:
+                continue
+            res = result[0]
+            timestamps = res.get("timestamp") or []
+            ind = res.get("indicators") or {}
+            quote = (ind.get("quote") or [{}])[0]
             def at(arr, idx):
-                if idx >= len(arr):
-                    return None
-                v = arr[idx]
-                if v is None:
+                if idx >= len(arr) or arr[idx] is None:
                     return None
                 try:
-                    v = float(v)
+                    v = float(arr[idx])
                     return v if v == v else None
                 except Exception:
                     return None
-            bars.append({
-                "date": datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d"),
-                "open": at(opens, i),
-                "high": at(highs, i),
-                "low": at(lows, i),
-                "close": at(closes, i),
-                "volume": int(vols[i]) if i < len(vols) and vols[i] is not None else 0,
-            })
-        meta = res.get("meta") or {}
-        return {
-            "ticker": ticker,
-            "currency": meta.get("currency"),
-            "exchange": meta.get("exchangeName"),
-            "first_trade_date": meta.get("firstTradeDate"),
-            "bars": bars,
-        }
-    except Exception as exc:
-        log.warning("Yahoo chart %s failed: %s", ticker, exc)
-        return None
+            bars = []
+            for i, ts in enumerate(timestamps):
+                bars.append({
+                    "date": datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d"),
+                    "open": at(quote.get("open") or [], i),
+                    "high": at(quote.get("high") or [], i),
+                    "low": at(quote.get("low") or [], i),
+                    "close": at(quote.get("close") or [], i),
+                    "volume": int((quote.get("volume") or [0])[i]) if i < len(quote.get("volume") or []) and (quote.get("volume") or [])[i] is not None else 0,
+                })
+            meta = res.get("meta") or {}
+            return {
+                "ticker": ticker,
+                "currency": meta.get("currency"),
+                "exchange": meta.get("exchangeName"),
+                "bars": bars,
+            }
+        except Exception as exc:
+            log.warning("Yahoo chart %s via %s failed: %s", ticker, host, exc)
+            continue
+    return None
 
 
 @app.route("/price/<symbol>")
@@ -697,15 +771,31 @@ def price(symbol: str):
     interval = request.args.get("interval", "1d")
     exchange = request.args.get("exchange", "NS").upper()
 
+    days = RANGE_TO_DAYS.get(range_param, 7300)
+
+    # Source 1: NSE historical (works because /quote works)
+    if "." not in sym and exchange != "BO":
+        bars = fetch_nse_history(sym, days)
+        if bars:
+            return jsonify({
+                "ticker": sym,
+                "range": range_param,
+                "interval": interval,
+                "count": len(bars),
+                "first": bars[0]["date"],
+                "last": bars[-1]["date"],
+                "currency": "INR",
+                "exchange": "NSE",
+                "bars": bars,
+                "_source": "NSE Historical",
+            })
+
+    # Source 2: Yahoo (fallback, including .BO requests)
     candidates: List[str] = []
     if "." in sym:
         candidates.append(sym)
     else:
-        if exchange == "BO":
-            candidates.extend([f"{sym}.BO", f"{sym}.NS"])
-        else:
-            candidates.extend([f"{sym}.NS", f"{sym}.BO"])
-
+        candidates.extend([f"{sym}.BO", f"{sym}.NS"] if exchange == "BO" else [f"{sym}.NS", f"{sym}.BO"])
     for ticker in candidates:
         result = fetch_yahoo_chart(ticker, range_param, interval)
         if result and result.get("bars"):
@@ -723,7 +813,7 @@ def price(symbol: str):
                 "_source": "Yahoo Finance v8/chart",
             })
 
-    return jsonify({"error": "no data", "tried": candidates, "symbol": sym}), 502
+    return jsonify({"error": "no data", "tried": candidates or [sym], "symbol": sym}), 502
 
 
 @app.route("/fundamentals/<symbol>")
