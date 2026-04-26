@@ -39,6 +39,9 @@ try:
 except ImportError:  # pragma: no cover
     yf = None
 
+# Yahoo Finance v8 chart endpoint — no auth required, used directly.
+YF_CHART = "https://query1.finance.yahoo.com/v8/finance/chart"
+
 # --------------------------------------------------------------------------- #
 #  Setup
 # --------------------------------------------------------------------------- #
@@ -396,41 +399,113 @@ def health():
     return jsonify({"ok": True, "ts": datetime.utcnow().isoformat() + "Z"})
 
 
+def search_nse_autocomplete(q: str) -> List[Dict[str, Any]]:
+    """Use NSE's live autocomplete. Same domain as /quote, so reachable from Render."""
+    s = nse_session()
+    url = f"https://www.nseindia.com/api/search/autocomplete?q={q}"
+    try:
+        r = s.get(url, timeout=DEFAULT_TIMEOUT, headers={"Referer": "https://www.nseindia.com/"})
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        out: List[Dict[str, Any]] = []
+        for item in (data.get("symbols") or []):
+            sym = (item.get("symbol") or "").strip()
+            info = (item.get("symbol_info") or "").strip()
+            if not sym:
+                continue
+            out.append({
+                "symbol": sym,
+                "name": info or sym,
+                "exchange": "NSE",
+                "yahoo": f"{sym}.NS",
+                "isin": item.get("symbol_isin", ""),
+                "bse_code": None,
+                "listing_date": "",
+                "_source": "NSE autocomplete",
+            })
+        return out
+    except Exception as exc:
+        log.warning("NSE autocomplete failed: %s", exc)
+        return []
+
+
+def search_screener(q: str) -> List[Dict[str, Any]]:
+    """Screener.in's public search. Returns hits across NSE+BSE."""
+    url = f"https://www.screener.in/api/company/search/?q={q}"
+    try:
+        r = requests.get(url, headers=_common_headers(), timeout=DEFAULT_TIMEOUT, proxies=PROXIES)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        out: List[Dict[str, Any]] = []
+        for item in (data if isinstance(data, list) else []):
+            sym = (item.get("url") or "").strip("/").split("/")[-1].upper()
+            if not sym:
+                sym = (item.get("name") or "").upper()
+            out.append({
+                "symbol": sym,
+                "name": item.get("name") or sym,
+                "exchange": "NSE" if not sym.isdigit() else "BSE",
+                "yahoo": f"{sym}.NS" if not sym.isdigit() else f"{sym}.BO",
+                "isin": "",
+                "bse_code": sym if sym.isdigit() else None,
+                "listing_date": "",
+                "_source": "Screener.in",
+            })
+        return out
+    except Exception as exc:
+        log.warning("Screener search failed: %s", exc)
+        return []
+
+
 @app.route("/search")
 def search():
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"results": [], "total_universe": len(_companies)})
-    if not _companies:
-        refresh_companies(force=True)
-    qu = q.upper()
-    matches: List[tuple] = []
-    for c in _companies:
-        sym = c["symbol"].upper()
-        name = c["name"].upper()
-        score = 0
-        if sym == qu:
-            score = 100
-        elif sym.startswith(qu):
-            score = 92
-        elif name.startswith(qu):
-            score = 85
-        elif qu in sym:
-            score = 70
-        elif qu in name:
-            score = 55
-        if score > 0:
-            # Slightly prefer NSE over BSE-only to surface liquid names first
-            if c["exchange"] == "NSE":
-                score += 1
-            matches.append((score, c))
-    matches.sort(key=lambda t: (-t[0], t[1]["name"]))
-    results = [c for _, c in matches[:25]]
+
+    # Source 1: cached NSE+BSE master (only populated if archives reachable)
+    matches_cached: List[tuple] = []
+    if _companies:
+        qu = q.upper()
+        for c in _companies:
+            sym = c["symbol"].upper()
+            name = c["name"].upper()
+            score = 0
+            if sym == qu: score = 100
+            elif sym.startswith(qu): score = 92
+            elif name.startswith(qu): score = 85
+            elif qu in sym: score = 70
+            elif qu in name: score = 55
+            if score > 0:
+                if c["exchange"] == "NSE": score += 1
+                matches_cached.append((score, c))
+        matches_cached.sort(key=lambda t: (-t[0], t[1]["name"]))
+        if matches_cached:
+            return jsonify({
+                "query": q,
+                "results": [c for _, c in matches_cached[:25]],
+                "total_universe": len(_companies),
+                "source": "cached NSE+BSE master",
+            })
+
+    # Source 2: NSE autocomplete (live)
+    results = search_nse_autocomplete(q)
+
+    # Source 3: Screener supplement (catches BSE-only and adds bse_code lookups)
+    screener_hits = search_screener(q)
+    seen = {r["symbol"] for r in results}
+    for h in screener_hits:
+        if h["symbol"] not in seen:
+            results.append(h)
+            seen.add(h["symbol"])
+
     return jsonify({
         "query": q,
-        "results": results,
+        "results": results[:25],
         "total_universe": len(_companies),
-        "source": "NSE EQUITY_L.csv + BSE ListofScripCode",
+        "source": "NSE autocomplete + Screener.in (live)",
     })
 
 
@@ -458,14 +533,41 @@ def quote(symbol: str):
         return jsonify({"error": str(exc), "symbol": sym}), 502
 
 
-@app.route("/news/<bsecode>")
-def news(bsecode: str):
-    code = re.sub(r"\D", "", bsecode)
-    if not code:
-        return jsonify({"error": "invalid bse code"}), 400
+def fetch_nse_announcements(symbol: str) -> Optional[List[Dict[str, Any]]]:
+    """NSE corporate announcements for an equity symbol. Uses nseindia.com (reachable)."""
+    s = nse_session()
+    url = f"https://www.nseindia.com/api/corporate-announcements?index=equities&symbol={symbol}"
+    try:
+        r = s.get(
+            url,
+            timeout=DEFAULT_TIMEOUT,
+            headers={"Referer": f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}"},
+        )
+        if r.status_code != 200:
+            return None
+        items = r.json() if isinstance(r.json(), list) else []
+        out = []
+        for it in items:
+            attach = it.get("attchmntFile")
+            link = attach if attach and attach.startswith("http") else (
+                f"https://nsearchives.nseindia.com/{attach.lstrip('/')}" if attach else None
+            )
+            out.append({
+                "headline": (it.get("attchmntText") or it.get("desc") or it.get("smIndustry") or "").strip(),
+                "category": (it.get("desc") or it.get("smIndustry") or "").strip(),
+                "date": it.get("an_dt") or it.get("sort_date") or "",
+                "url": link,
+            })
+        return out
+    except Exception as exc:
+        log.warning("NSE announcements failed for %s: %s", symbol, exc)
+        return None
+
+
+def fetch_bse_announcements(bsecode: str) -> Optional[List[Dict[str, Any]]]:
     url = (
         "https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w"
-        f"?strCat=-1&strPrevDate=&strScrip={code}&strSearch=P&strToDate=&strType=C"
+        f"?strCat=-1&strPrevDate=&strScrip={bsecode}&strSearch=P&strToDate=&strType=C"
     )
     headers = _common_headers({
         "Origin": "https://www.bseindia.com",
@@ -473,100 +575,155 @@ def news(bsecode: str):
     })
     try:
         r = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT, proxies=PROXIES)
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("Table") or []
-        normalized = []
+        if r.status_code != 200:
+            return None
+        items = r.json().get("Table") or []
+        out = []
         for it in items:
-            headline = it.get("HEADLINE") or it.get("NEWSSUB") or ""
-            cat = it.get("CATEGORYNAME") or it.get("SUBCATNAME") or ""
-            dt = it.get("NEWS_DT") or it.get("News_submission_dt") or ""
             attach = it.get("ATTACHMENTNAME")
-            link = (
-                f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attach}"
-                if attach else None
-            )
-            normalized.append({
-                "headline": headline.strip(),
-                "category": cat.strip(),
-                "date": dt,
+            link = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attach}" if attach else None
+            out.append({
+                "headline": (it.get("HEADLINE") or it.get("NEWSSUB") or "").strip(),
+                "category": (it.get("CATEGORYNAME") or it.get("SUBCATNAME") or "").strip(),
+                "date": it.get("NEWS_DT") or it.get("News_submission_dt") or "",
                 "url": link,
             })
-        return jsonify({
-            "bse_code": code,
-            "count": len(normalized),
-            "items": normalized,
-            "_source": "BSE Corporate Announcements",
-        })
+        return out
     except Exception as exc:
-        log.error("/news/%s failed: %s", code, exc)
-        return jsonify({"error": str(exc), "bse_code": code}), 502
+        log.warning("BSE announcements failed for %s: %s", bsecode, exc)
+        return None
+
+
+@app.route("/news/<identifier>")
+def news(identifier: str):
+    """Accepts NSE symbol (preferred) OR BSE numeric code. Tries NSE first, then BSE."""
+    ident = identifier.strip().upper()
+    sources_tried: List[str] = []
+
+    # Symbol (alphabetical) -> NSE first
+    if not ident.isdigit():
+        sources_tried.append("NSE")
+        out = fetch_nse_announcements(ident)
+        if out is not None:
+            return jsonify({
+                "id": ident,
+                "count": len(out),
+                "items": out,
+                "_source": "NSE Corporate Announcements",
+            })
+
+    # Numeric -> BSE
+    if ident.isdigit():
+        sources_tried.append("BSE")
+        out = fetch_bse_announcements(ident)
+        if out is not None:
+            return jsonify({
+                "id": ident,
+                "count": len(out),
+                "items": out,
+                "_source": "BSE Corporate Announcements",
+            })
+
+    return jsonify({"error": "no announcements", "id": ident, "tried": sources_tried}), 502
+
+
+def fetch_yahoo_chart(ticker: str, range_: str, interval: str) -> Optional[Dict[str, Any]]:
+    """Direct call to Yahoo's v8 chart endpoint. No auth/cookies required."""
+    url = f"{YF_CHART}/{ticker}"
+    headers = _common_headers({
+        "Accept": "application/json",
+        "Origin": "https://finance.yahoo.com",
+        "Referer": f"https://finance.yahoo.com/quote/{ticker}",
+    })
+    params = {"range": range_, "interval": interval, "includeAdjustedClose": "true"}
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=DEFAULT_TIMEOUT, proxies=PROXIES)
+        if r.status_code != 200:
+            log.warning("Yahoo chart %s -> %s", ticker, r.status_code)
+            return None
+        data = r.json()
+        result = (data.get("chart") or {}).get("result")
+        if not result:
+            err = (data.get("chart") or {}).get("error")
+            log.warning("Yahoo chart %s no result: %s", ticker, err)
+            return None
+        res = result[0]
+        timestamps = res.get("timestamp") or []
+        ind = res.get("indicators") or {}
+        quote = (ind.get("quote") or [{}])[0]
+        opens = quote.get("open") or []
+        highs = quote.get("high") or []
+        lows = quote.get("low") or []
+        closes = quote.get("close") or []
+        vols = quote.get("volume") or []
+        bars = []
+        for i, ts in enumerate(timestamps):
+            def at(arr, idx):
+                if idx >= len(arr):
+                    return None
+                v = arr[idx]
+                if v is None:
+                    return None
+                try:
+                    v = float(v)
+                    return v if v == v else None
+                except Exception:
+                    return None
+            bars.append({
+                "date": datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d"),
+                "open": at(opens, i),
+                "high": at(highs, i),
+                "low": at(lows, i),
+                "close": at(closes, i),
+                "volume": int(vols[i]) if i < len(vols) and vols[i] is not None else 0,
+            })
+        meta = res.get("meta") or {}
+        return {
+            "ticker": ticker,
+            "currency": meta.get("currency"),
+            "exchange": meta.get("exchangeName"),
+            "first_trade_date": meta.get("firstTradeDate"),
+            "bars": bars,
+        }
+    except Exception as exc:
+        log.warning("Yahoo chart %s failed: %s", ticker, exc)
+        return None
 
 
 @app.route("/price/<symbol>")
 def price(symbol: str):
-    if yf is None:
-        return jsonify({"error": "yfinance not installed"}), 500
     sym = symbol.upper().strip()
     range_param = request.args.get("range", "max")
     interval = request.args.get("interval", "1d")
     exchange = request.args.get("exchange", "NS").upper()
 
-    # Build candidate tickers — the same symbol may exist on NSE or BSE
     candidates: List[str] = []
     if "." in sym:
         candidates.append(sym)
     else:
         if exchange == "BO":
-            candidates.append(f"{sym}.BO")
-            candidates.append(f"{sym}.NS")
+            candidates.extend([f"{sym}.BO", f"{sym}.NS"])
         else:
-            candidates.append(f"{sym}.NS")
-            candidates.append(f"{sym}.BO")
+            candidates.extend([f"{sym}.NS", f"{sym}.BO"])
 
-    last_err: Optional[str] = None
     for ticker in candidates:
-        try:
-            t = yf.Ticker(ticker)
-            df = t.history(period=range_param, interval=interval, auto_adjust=False)
-            if df.empty:
-                continue
-            bars = []
-            for ts, row in df.iterrows():
-                def fnum(v):
-                    try:
-                        v = float(v)
-                        return v if v == v else None  # NaN check
-                    except Exception:
-                        return None
-                bars.append({
-                    "date": ts.strftime("%Y-%m-%d"),
-                    "open": fnum(row.get("Open")),
-                    "high": fnum(row.get("High")),
-                    "low": fnum(row.get("Low")),
-                    "close": fnum(row.get("Close")),
-                    "volume": int(row["Volume"]) if row.get("Volume") == row.get("Volume") else 0,
-                })
+        result = fetch_yahoo_chart(ticker, range_param, interval)
+        if result and result.get("bars"):
+            bars = result["bars"]
             return jsonify({
-                "ticker": ticker,
+                "ticker": result["ticker"],
                 "range": range_param,
                 "interval": interval,
                 "count": len(bars),
                 "first": bars[0]["date"] if bars else None,
                 "last": bars[-1]["date"] if bars else None,
+                "currency": result.get("currency"),
+                "exchange": result.get("exchange"),
                 "bars": bars,
-                "_source": "Yahoo Finance",
+                "_source": "Yahoo Finance v8/chart",
             })
-        except Exception as exc:
-            last_err = str(exc)
-            log.warning("yfinance %s failed: %s", ticker, exc)
-            continue
 
-    return jsonify({
-        "error": last_err or "no data",
-        "tried": candidates,
-        "symbol": sym,
-    }), 502
+    return jsonify({"error": "no data", "tried": candidates, "symbol": sym}), 502
 
 
 @app.route("/fundamentals/<symbol>")
