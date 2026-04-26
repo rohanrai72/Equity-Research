@@ -26,7 +26,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -766,54 +766,81 @@ def fetch_yahoo_chart(ticker: str, range_: str, interval: str) -> Optional[Dict[
 
 @app.route("/price/<symbol>")
 def price(symbol: str):
-    sym = symbol.upper().strip()
-    range_param = request.args.get("range", "max")
-    interval = request.args.get("interval", "1d")
-    exchange = request.args.get("exchange", "NS").upper()
+    import traceback
+    try:
+        sym = symbol.upper().strip()
+        range_param = request.args.get("range", "max")
+        interval = request.args.get("interval", "1d")
+        exchange = request.args.get("exchange", "NS").upper()
 
-    days = RANGE_TO_DAYS.get(range_param, 7300)
+        days = RANGE_TO_DAYS.get(range_param, 7300)
 
-    # Source 1: NSE historical (works because /quote works)
-    if "." not in sym and exchange != "BO":
-        bars = fetch_nse_history(sym, days)
-        if bars:
-            return jsonify({
-                "ticker": sym,
-                "range": range_param,
-                "interval": interval,
-                "count": len(bars),
-                "first": bars[0]["date"],
-                "last": bars[-1]["date"],
-                "currency": "INR",
-                "exchange": "NSE",
-                "bars": bars,
-                "_source": "NSE Historical",
-            })
+        # Source 1: NSE historical (works because /quote works)
+        nse_err = None
+        if "." not in sym and exchange != "BO":
+            try:
+                bars = fetch_nse_history(sym, days)
+            except Exception as exc:
+                log.exception("NSE history raised for %s", sym)
+                bars = []
+                nse_err = str(exc)
+            if bars:
+                return jsonify({
+                    "ticker": sym,
+                    "range": range_param,
+                    "interval": interval,
+                    "count": len(bars),
+                    "first": bars[0]["date"],
+                    "last": bars[-1]["date"],
+                    "currency": "INR",
+                    "exchange": "NSE",
+                    "bars": bars,
+                    "_source": "NSE Historical",
+                })
 
-    # Source 2: Yahoo (fallback, including .BO requests)
-    candidates: List[str] = []
-    if "." in sym:
-        candidates.append(sym)
-    else:
-        candidates.extend([f"{sym}.BO", f"{sym}.NS"] if exchange == "BO" else [f"{sym}.NS", f"{sym}.BO"])
-    for ticker in candidates:
-        result = fetch_yahoo_chart(ticker, range_param, interval)
-        if result and result.get("bars"):
-            bars = result["bars"]
-            return jsonify({
-                "ticker": result["ticker"],
-                "range": range_param,
-                "interval": interval,
-                "count": len(bars),
-                "first": bars[0]["date"] if bars else None,
-                "last": bars[-1]["date"] if bars else None,
-                "currency": result.get("currency"),
-                "exchange": result.get("exchange"),
-                "bars": bars,
-                "_source": "Yahoo Finance v8/chart",
-            })
+        # Source 2: Yahoo (fallback, including .BO requests)
+        candidates: List[str] = []
+        if "." in sym:
+            candidates.append(sym)
+        else:
+            candidates.extend([f"{sym}.BO", f"{sym}.NS"] if exchange == "BO" else [f"{sym}.NS", f"{sym}.BO"])
+        yf_err = None
+        for ticker in candidates:
+            try:
+                result = fetch_yahoo_chart(ticker, range_param, interval)
+            except Exception as exc:
+                log.exception("Yahoo chart raised for %s", ticker)
+                result = None
+                yf_err = str(exc)
+            if result and result.get("bars"):
+                bars = result["bars"]
+                return jsonify({
+                    "ticker": result["ticker"],
+                    "range": range_param,
+                    "interval": interval,
+                    "count": len(bars),
+                    "first": bars[0]["date"] if bars else None,
+                    "last": bars[-1]["date"] if bars else None,
+                    "currency": result.get("currency"),
+                    "exchange": result.get("exchange"),
+                    "bars": bars,
+                    "_source": "Yahoo Finance v8/chart",
+                })
 
-    return jsonify({"error": "no data", "tried": candidates or [sym], "symbol": sym}), 502
+        return jsonify({
+            "error": "no data from NSE or Yahoo",
+            "tried": candidates or [sym],
+            "symbol": sym,
+            "nse_error": nse_err,
+            "yahoo_error": yf_err,
+        }), 502
+    except Exception as exc:
+        log.exception("/price/%s crashed", symbol)
+        return jsonify({
+            "error": "unexpected error",
+            "detail": str(exc),
+            "trace": traceback.format_exc().splitlines()[-5:],
+        }), 500
 
 
 @app.route("/fundamentals/<symbol>")
