@@ -430,8 +430,11 @@ def search_nse_autocomplete(q: str) -> List[Dict[str, Any]]:
         return []
 
 
+_SCREENER_SLUG_RE = re.compile(r"/company/([^/]+)", re.IGNORECASE)
+
+
 def search_screener(q: str) -> List[Dict[str, Any]]:
-    """Screener.in's public search. Returns hits across NSE+BSE."""
+    """Screener.in's public search. Captures NSE + BSE-only listings."""
     url = f"https://www.screener.in/api/company/search/?q={q}"
     try:
         r = requests.get(url, headers=_common_headers(), timeout=DEFAULT_TIMEOUT, proxies=PROXIES)
@@ -440,16 +443,19 @@ def search_screener(q: str) -> List[Dict[str, Any]]:
         data = r.json()
         out: List[Dict[str, Any]] = []
         for item in (data if isinstance(data, list) else []):
-            sym = (item.get("url") or "").strip("/").split("/")[-1].upper()
+            url_str = (item.get("url") or "").strip()
+            m = _SCREENER_SLUG_RE.search(url_str)
+            sym = (m.group(1) if m else "").upper()
             if not sym:
-                sym = (item.get("name") or "").upper()
+                continue
+            is_numeric = sym.isdigit()
             out.append({
                 "symbol": sym,
-                "name": item.get("name") or sym,
-                "exchange": "NSE" if not sym.isdigit() else "BSE",
-                "yahoo": f"{sym}.NS" if not sym.isdigit() else f"{sym}.BO",
+                "name": (item.get("name") or sym).strip(),
+                "exchange": "BSE" if is_numeric else "NSE",
+                "yahoo": f"{sym}.BO" if is_numeric else f"{sym}.NS",
                 "isin": "",
-                "bse_code": sym if sym.isdigit() else None,
+                "bse_code": sym if is_numeric else None,
                 "listing_date": "",
                 "_source": "Screener.in",
             })
@@ -465,10 +471,21 @@ def search():
     if not q:
         return jsonify({"results": [], "total_universe": len(_companies)})
 
+    qu = q.upper()
+    results: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    def _add(item: Dict[str, Any], score: int, via: str) -> None:
+        key = (item["symbol"].upper(), item.get("exchange") or "")
+        if key in seen:
+            return
+        seen.add(key)
+        item["_score"] = score
+        item["_via"] = via
+        results.append(item)
+
     # Source 1: cached NSE+BSE master (only populated if archives reachable)
-    matches_cached: List[tuple] = []
     if _companies:
-        qu = q.upper()
         for c in _companies:
             sym = c["symbol"].upper()
             name = c["name"].upper()
@@ -479,33 +496,24 @@ def search():
             elif qu in sym: score = 70
             elif qu in name: score = 55
             if score > 0:
-                if c["exchange"] == "NSE": score += 1
-                matches_cached.append((score, c))
-        matches_cached.sort(key=lambda t: (-t[0], t[1]["name"]))
-        if matches_cached:
-            return jsonify({
-                "query": q,
-                "results": [c for _, c in matches_cached[:25]],
-                "total_universe": len(_companies),
-                "source": "cached NSE+BSE master",
-            })
+                if c["exchange"] == "NSE":
+                    score += 1
+                _add(dict(c), score, "cached")
 
     # Source 2: NSE autocomplete (live)
-    results = search_nse_autocomplete(q)
+    for it in search_nse_autocomplete(q):
+        _add(it, 80, "nse_autocomplete")
 
-    # Source 3: Screener supplement (catches BSE-only and adds bse_code lookups)
-    screener_hits = search_screener(q)
-    seen = {r["symbol"] for r in results}
-    for h in screener_hits:
-        if h["symbol"] not in seen:
-            results.append(h)
-            seen.add(h["symbol"])
+    # Source 3: Screener (catches BSE-only)
+    for it in search_screener(q):
+        _add(it, 60, "screener")
 
+    results.sort(key=lambda r: (-r.get("_score", 0), r["name"]))
     return jsonify({
         "query": q,
-        "results": results[:25],
+        "results": results[:30],
         "total_universe": len(_companies),
-        "source": "NSE autocomplete + Screener.in (live)",
+        "source": "NSE cache + autocomplete + Screener.in (merged)",
     })
 
 
