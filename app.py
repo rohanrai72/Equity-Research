@@ -376,6 +376,34 @@ def scrape_screener(symbol: str) -> Optional[Dict[str, Any]]:
 
 @app.route("/")
 def root():
+    """Serve the dashboard HTML if present, else JSON service info."""
+    import os.path
+    here = os.path.dirname(os.path.abspath(__file__))
+    html_path = os.path.join(here, "dashboard.html")
+    if os.path.exists(html_path):
+        # Patch the BACKEND constant so the dashboard talks to *this* host
+        # without needing manual edits.
+        try:
+            with open(html_path, "r", encoding="utf-8") as fh:
+                html = fh.read()
+            origin = request.host_url.rstrip("/")
+            html = html.replace(
+                'const BACKEND = "https://equity-research-rwa9.onrender.com";',
+                f'const BACKEND = "{origin}";'
+            )
+            return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+        except Exception as exc:
+            log.warning("Failed to serve dashboard.html: %s", exc)
+    return _service_info()
+
+
+@app.route("/api")
+@app.route("/api/")
+def api_info():
+    return _service_info()
+
+
+def _service_info():
     with _companies_lock:
         n = len(_companies)
         ts = _companies_ts
